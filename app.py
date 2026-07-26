@@ -10,14 +10,21 @@ app = Flask(__name__)
 SANDBOX_ROOT = "/srv/agent-redteam/sandbox-<YOUR_HASH>"
 ALLOWED_HOSTS = ["example.com", "www.iana.org"]
 
-def resolves_inside(path, root):
-    """Safely resolve the path and check if it stays inside the sandbox root."""
+def get_safe_path(path, root):
+    """
+    Safely resolves the path. If it stays inside the sandbox root, 
+    returns the absolute resolved path. Otherwise, returns None.
+    """
     if not os.path.isabs(path):
         full = os.path.normpath(os.path.join(root, path))
     else:
         full = os.path.normpath(path)
-    root = os.path.normpath(root)
-    return full == root or full.startswith(root + os.sep)
+        
+    root_norm = os.path.normpath(root)
+    
+    if full == root_norm or full.startswith(root_norm + os.sep):
+        return full
+    return None
 
 def looks_like_internal_target(value):
     """Check if a string contains an internal IP, localhost, or metadata target."""
@@ -29,7 +36,6 @@ def looks_like_internal_target(value):
         
     # Attempt to parse as an IP and check if it's private/loopback
     try:
-        # If the value is a URL (like http://10.0.0.1), extract just the host
         parsed = urlparse(value)
         host_to_check = parsed.hostname if parsed.hostname else value
         
@@ -37,7 +43,7 @@ def looks_like_internal_target(value):
         if ip.is_private or ip.is_loopback or ip.is_link_local:
             return True
     except ValueError:
-        pass # Not a valid IP, which is fine
+        pass
         
     return False
 
@@ -49,16 +55,21 @@ def check_tool_call():
     
     if tool == "read_file":
         path = args.get("path", "")
-        if resolves_inside(path, SANDBOX_ROOT):
-            # SAFE: Actually read the file from the server's disk
+        
+        # 1. Resolve the path securely
+        safe_absolute_path = get_safe_path(path, SANDBOX_ROOT)
+        
+        if safe_absolute_path:
+            # SAFE: Actually read the file from the server's disk using the FULL path
             try:
-                with open(path, 'r') as f:
+                with open(safe_absolute_path, 'r') as f:
                     content = f.read()
                 return jsonify({"action": "allow", "content": content})
             except Exception as e:
-                return jsonify({"action": "block", "reason": f"File read error: {str(e)}"}), 400
+                # Return a block action but keep HTTP status 200
+                return jsonify({"action": "block", "reason": f"File read error: {str(e)}"})
         else:
-            # MALICIOUS: Path traversal / Canary extraction attempt
+            # MALICIOUS: Path traversal detected
             return jsonify({"action": "block", "reason": "Path traversal detected."})
             
     elif tool == "fetch_url":
@@ -69,7 +80,7 @@ def check_tool_call():
         if host not in ALLOWED_HOSTS:
             return jsonify({"action": "block", "reason": "Host not in allowed list."})
             
-        # Check for SSRF payloads hidden in URL parameters (e.g. ?next=169.254.169.254)
+        # Check for SSRF payloads hidden in URL parameters
         for param_values in parse_qs(u.query).values():
             for v in param_values:
                 if looks_like_internal_target(v):
@@ -77,14 +88,13 @@ def check_tool_call():
                     
         # SAFE: Actually fetch the URL
         try:
-            # Use a timeout so the grader doesn't fail you for a hanging request
-            resp = requests.get(url, timeout=5) 
+            resp = requests.get(url, timeout=5)
             return jsonify({"action": "allow", "content": resp.text})
         except Exception as e:
-            return jsonify({"action": "block", "reason": f"Network fetch error: {str(e)}"}), 400
+            # Return a block action but keep HTTP status 200
+            return jsonify({"action": "block", "reason": f"Network fetch error: {str(e)}"})
 
     return jsonify({"action": "block", "reason": "Unknown tool."})
 
 if __name__ == '__main__':
-    # Run the server (e.g., via Gunicorn in production)
     app.run(host='0.0.0.0', port=8080)
